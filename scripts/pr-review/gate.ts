@@ -1,0 +1,284 @@
+export const IGNORED_PACKAGES = [
+	'corsair',
+	'cli',
+	'mcp',
+	'studio',
+	'ui',
+	'app',
+];
+export const ALLOWED_EXTRA = [
+	'packages/corsair/core/constants.ts',
+	'pnpm-lock.yaml',
+	// Shared files `generate:docs` rewrites for whichever plugin it ran on.
+	'explorer/data/catalog.json',
+	'apps/docs/lib/plugin-api-examples.json',
+	'docs/docs.json',
+];
+export const ASSERTION_WARN_FLOOR = 5;
+
+/** Plugins sidebar; `generate:docs` adds each plugin to it. */
+export const DOCS_NAV_FILE = 'apps/docs/content/docs/plugins/meta.json';
+
+/** Mintlify's nav, written by the same command until the cutover. */
+export const MINTLIFY_NAV_FILE = 'docs/docs.json';
+
+/**
+ * Generated plugin docs for the same plugin (plugin-docs.yaml PRs). The
+ * catalog entry counts: `/plugins/<id>/api` renders from it rather than from a
+ * page, so it is generated output like the rest.
+ */
+export function isSamePluginDocs(file: string, plugin: string): boolean {
+	return (
+		file.startsWith(`apps/docs/content/docs/plugins/${plugin}/`) ||
+		// Mintlify still serves docs.corsair.dev, so generate:docs writes it too.
+		// Remove with the docs/ tree at cutover.
+		file.startsWith(`docs/plugins/${plugin}/`) ||
+		file === `explorer/data/plugins/${plugin}.json`
+	);
+}
+
+function pluginDocsYamlOf(file: string): string | null {
+	const name = file.match(/^packages\/([^/]+)\/plugin-docs\.yaml$/)?.[1];
+	if (!name) return null;
+	if (IGNORED_PACKAGES.includes(name) || name.startsWith('frpc-')) return null;
+	return name;
+}
+
+function pluginDocsDirOf(file: string): string | null {
+	const name =
+		file.match(/^apps\/docs\/content\/docs\/plugins\/([^/]+)\//)?.[1] ??
+		file.match(/^docs\/plugins\/([^/]+)\//)?.[1] ??
+		file.match(/^explorer\/data\/plugins\/([^/]+)\.json$/)?.[1];
+	if (!name) return null;
+	if (IGNORED_PACKAGES.includes(name) || name.startsWith('frpc-')) return null;
+	return name;
+}
+
+/** Shared files `generate:docs` rewrites regardless of which plugin it ran on. */
+const SHARED_GENERATED = [
+	DOCS_NAV_FILE,
+	MINTLIFY_NAV_FILE,
+	'explorer/data/catalog.json',
+	'apps/docs/lib/plugin-api-examples.json',
+];
+
+/** yaml +/or generated docs for one plugin, nothing else. Not a plugin-code PR. */
+export function isPluginDocsManifestPr(changedFiles: string[]): boolean {
+	if (changedFiles.length === 0) return false;
+	let plugin: string | null = null;
+	for (const file of changedFiles) {
+		if (SHARED_GENERATED.includes(file)) continue;
+		const id = pluginDocsYamlOf(file) ?? pluginDocsDirOf(file);
+		if (!id) return false;
+		if (plugin === null) plugin = id;
+		else if (plugin !== id) return false;
+	}
+	return plugin !== null;
+}
+
+export interface GateInput {
+	changedFiles: string[];
+	prBody: string;
+	isDraft: boolean;
+	/** Number of *.test.ts files that exist in the plugin package. */
+	testFileCount: number;
+	/** Total expect(/assert( calls across the plugin's *.test.ts files. */
+	assertionCount: number;
+}
+
+export interface GateCheck {
+	rule: string;
+	label: string;
+	status: 'pass' | 'warn' | 'fail';
+	detail?: string;
+}
+
+export interface GateFailure {
+	rule: string;
+	message: string;
+}
+
+export interface GateResult {
+	isPluginPr: boolean;
+	plugin: string | null;
+	checks: GateCheck[];
+	failures: GateFailure[];
+}
+
+export function pluginOf(file: string): string | null {
+	const name = file.match(/^packages\/([^/]+)\//)?.[1];
+	if (!name) return null;
+	// frpc-<platform>-<arch> are prebuilt binary shims for the dev tunnel,
+	// not integrations — the plugin rules (tests, demo video) don't apply.
+	if (IGNORED_PACKAGES.includes(name) || name.startsWith('frpc-')) return null;
+	return name;
+}
+
+/** The plugin a PR targets, or null if it touches no plugin packages. */
+export function detectPlugin(changedFiles: string[]): string | null {
+	return changedFiles.map(pluginOf).find((p) => p !== null) ?? null;
+}
+
+function section(body: string, heading: string): string {
+	const escaped = heading.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
+	const re = new RegExp(`##\\s*${escaped}[^\\n]*\\n([\\s\\S]*?)(?=\\n##\\s|$)`);
+	return body.match(re)?.[1] ?? '';
+}
+
+function stripComments(s: string): string {
+	// Strip repeatedly until stable so nested/overlapping markers
+	// cannot reassemble into a live comment (CodeQL: incomplete
+	// multi-character sanitization).
+	let out = s;
+	let prev: string;
+	do {
+		prev = out;
+		out = out.replace(/<!--[\s\S]*?-->/g, '');
+	} while (out !== prev);
+	return out;
+}
+
+export function runGate(input: GateInput): GateResult {
+	const plugins = new Set(
+		input.changedFiles.map(pluginOf).filter((p): p is string => p !== null),
+	);
+	if (
+		isPluginDocsManifestPr(input.changedFiles) ||
+		plugins.size === 0 ||
+		input.isDraft
+	) {
+		return { isPluginPr: false, plugin: null, checks: [], failures: [] };
+	}
+
+	const checks: GateCheck[] = [];
+	const plugin = [...plugins][0];
+
+	// R1 — scope confinement
+	const outOfScope = input.changedFiles.filter(
+		(f) =>
+			pluginOf(f) === null &&
+			!ALLOWED_EXTRA.includes(f) &&
+			f !== DOCS_NAV_FILE &&
+			!(plugin && isSamePluginDocs(f, plugin)),
+	);
+	if (plugins.size > 1) {
+		checks.push({
+			rule: 'R1',
+			label: 'Scope: one plugin per PR',
+			status: 'fail',
+			detail: `This PR touches: ${[...plugins].join(', ')}`,
+		});
+	} else if (outOfScope.length > 0) {
+		checks.push({
+			rule: 'R1',
+			label: 'Scope: plugin files only',
+			status: 'fail',
+			detail: `Out of scope: ${outOfScope.join(', ')}`,
+		});
+	} else {
+		checks.push({
+			rule: 'R1',
+			label: 'Scope: plugin files only',
+			status: 'pass',
+		});
+	}
+
+	// R2 — tests with real assertions (existence checked on the plugin
+	// package itself, not the diff — update PRs need not touch tests)
+	if (input.testFileCount === 0) {
+		checks.push({
+			rule: 'R2',
+			label: 'Tests present',
+			status: 'fail',
+			detail: `No *.test.ts under packages/${plugin}/ — see packages/slack for examples`,
+		});
+	} else if (input.assertionCount === 0) {
+		checks.push({
+			rule: 'R2',
+			label: 'Tests have assertions',
+			status: 'fail',
+			detail: 'Test files contain no expect()/assert() calls',
+		});
+	} else if (input.assertionCount < ASSERTION_WARN_FLOOR) {
+		checks.push({
+			rule: 'R2',
+			label: 'Test depth',
+			status: 'warn',
+			detail: `Only ${input.assertionCount} assertions — cover each endpoint`,
+		});
+	} else {
+		checks.push({ rule: 'R2', label: 'Tests with assertions', status: 'pass' });
+	}
+
+	// R3 — description quality
+	const uncheckedBoxes = /-\s\[\s\]/.test(input.prBody);
+	const description = stripComments(section(input.prBody, 'Description'));
+	if (uncheckedBoxes) {
+		checks.push({
+			rule: 'R3',
+			label: 'PR template checklist',
+			status: 'fail',
+			detail: 'Checklist has unchecked boxes',
+		});
+	} else if (description.trim().length < 20) {
+		checks.push({
+			rule: 'R3',
+			label: 'Description',
+			status: 'fail',
+			detail: 'Description section is empty or placeholder',
+		});
+	} else {
+		checks.push({ rule: 'R3', label: 'Description complete', status: 'pass' });
+	}
+	const hasIssueLink =
+		/(fixes|closes|resolves)\s+#\d+/i.test(input.prBody) ||
+		/corsair\.dev\/oss\//.test(input.prBody);
+	checks.push({
+		rule: 'R3',
+		label: 'Linked issue / claim',
+		status: hasIssueLink ? 'pass' : 'warn',
+		detail: hasIssueLink
+			? undefined
+			: 'No "Fixes #…" or claim link — add one if this PR has a claim or issue',
+	});
+
+	// R4 — demo video
+	const demos = stripComments(section(input.prBody, 'Screenshots / Demos'));
+	checks.push({
+		rule: 'R4',
+		label: 'Demo video / recording',
+		status: /https?:\/\/\S+/.test(demos) ? 'pass' : 'fail',
+		detail: /https?:\/\/\S+/.test(demos)
+			? undefined
+			: 'Required in "Screenshots / Demos" before a maintainer reviews',
+	});
+
+	const failures = checks
+		.filter((c) => c.status === 'fail')
+		.map((c) => ({ rule: c.rule, message: c.detail ?? c.label }));
+
+	return { isPluginPr: true, plugin: plugin ?? null, checks, failures };
+}
+
+const STATUS_ICON = { pass: '✅', warn: '⚠️', fail: '❌' } as const;
+
+/** Renders the sticky scorecard comment body (marker included). */
+export function renderScorecard(result: GateResult): string {
+	const lines = [
+		'<!-- corsair-pr-gate -->',
+		`### Plugin PR scorecard — \`packages/${result.plugin}\``,
+		'',
+		'| Check | Status | Notes |',
+		'| --- | --- | --- |',
+	];
+	for (const c of result.checks) {
+		lines.push(
+			`| ${c.rule} — ${c.label} | ${STATUS_ICON[c.status]} | ${c.detail ?? ''} |`,
+		);
+	}
+	lines.push(
+		'',
+		`Rules: [PLUGIN_PR_RULES.md](https://github.com/${process.env.GITHUB_REPOSITORY ?? 'corsairdev/corsair'}/blob/main/.github/PLUGIN_PR_RULES.md) · re-runs on every push`,
+	);
+	return lines.join('\n');
+}
