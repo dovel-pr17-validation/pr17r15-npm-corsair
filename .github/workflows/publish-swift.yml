@@ -22,14 +22,14 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout monorepo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Derive version
         id: version
         run: echo "value=${GITHUB_REF_NAME#corsair-swift-v}" >> "$GITHUB_OUTPUT"
 
       - name: Checkout mirror
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: corsairdev/corsair-swift
           token: ${{ secrets.SWIFT_MIRROR_TOKEN }}
