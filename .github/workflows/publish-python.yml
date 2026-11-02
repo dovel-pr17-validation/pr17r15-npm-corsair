@@ -18,7 +18,7 @@ jobs:
     timeout-minutes: 10
     environment: pypi
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Verify tag matches package version
         working-directory: clients/python
